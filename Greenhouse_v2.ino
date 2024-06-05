@@ -1,15 +1,21 @@
-/*  Programa para ESP32 antes da atualização OTA */
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Update.h>
 #include "time.h"
+#include <Update.h>
+#include <ESPmDNS.h>
+#include <WebServer.h>
 #include <Arduino_JSON.h>
-#include <ArduinoWebsockets.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
 
-// Watchdog
-hw_timer_t *timer = NULL;
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint8_t temprature_sens_read();
+#ifdef __cplusplus
+}
+#endif
+uint8_t temprature_sens_read();
+
 // LED
 const int led = 2;
 
@@ -19,14 +25,21 @@ const int fan = 5;            // amarelo
 const int exaust = 16;        // laranja
 
 /* Device manufacturer */
-const String serial = "GH00000001";
-const String client_id = "";
+const char *serial = "GH00000001";
  
 /* Constantes - conexão wi-fi e webserver */
 const char* host = "greenhouse";
 const char* ssid = "VIVOFIBRA-EED0"; /* coloque aqui o nome da rede wi-fi que o ESP32 deve se conectar */
 const char* password = "98391748C5"; /* coloque aqui a senha da rede wi-fi que o ESP32 deve se conectar */
-const String websockets_server = "wss://automotion.app:8080/?token="+serial;
+
+// MQTT Broker
+const char *mqtt_broker = "automotion.app";
+const char *topic = "commands/";
+const char *status_topic = "status";
+const char *mqtt_username = "erickcrus";
+const char *mqtt_password = "12345678";
+const int mqtt_port = 8883;
+
 
 const char echo_org_ssl_ca_cert[] PROGMEM = \
 "-----BEGIN CERTIFICATE-----\n" \
@@ -61,8 +74,15 @@ const char echo_org_ssl_ca_cert[] PROGMEM = \
 "Dfvp7OOGAN6dEOM4+qR9sdjoSYKEBpsr6GtPAQw4dy753ec5\n" \
 "-----END CERTIFICATE-----\n";
 
-using namespace websockets;
-WebsocketsClient client;
+WiFiClientSecure wifiClient;
+PubSubClient client(wifiClient);
+
+QueueHandle_t QueueHandle;
+const int QueueElementSize = 10;
+typedef struct {
+  char line[128];
+  uint8_t line_length;
+} message_t;
  
 /* Variáveis globais */
 int contador_ms = 0;
@@ -158,24 +178,6 @@ const char* serverIndex =
  "});"
  "</script>";
 
-void onEventsCallback(WebsocketsEvent event, String data) {
-  if(event == WebsocketsEvent::ConnectionOpened){
-    JSONVar output;
-    output["serial"] = serial;
-    output["fanStatus"] = !digitalRead(fan);
-    output["lampStatus"] = !digitalRead(lamp);
-    output["exaustStatus"] = !digitalRead(exaust);
-    
-    String output_message = JSON.stringify(output);
-    client.send(output_message);        // envia os estados dos atuadores para o client
-    logAction("WebSocket client connected to server");
-  }
-  else if(event == WebsocketsEvent::ConnectionClosed){
-    logAction("WebSocket client disconnected from server");
-    ESP.restart();
-  }
-}
-
 void setFan(bool status) {
   if(status) {
     digitalWrite(fan, LOW);
@@ -203,45 +205,63 @@ void setExaust(bool status) {
   }
 }
 
-void initWebSocket(void){
-  client.onEvent(onEventsCallback);
-  client.onMessage([&](WebsocketsMessage message) {
-    String msg = message.data();
-    JSONVar obj = JSON.parse(msg);
+void proccessQueue( void * pvParameters ){
+  message_t message;
+  while(true){
+    if (QueueHandle != NULL) {
+      int ret = xQueueReceive(QueueHandle, &message, 10000);
+      if (ret == pdPASS) {
+        String msg = message.line;
+        JSONVar obj = JSON.parse(msg);
 
-    if(JSON.typeof(obj) == "undefined"){
-      logAction(msg);
-      return;
+        if(JSON.typeof(obj) == "undefined"){
+          logAction(msg);
+          return;
+        }
+
+        if (obj.hasOwnProperty("lamp")) {
+          setLamp((bool) obj["lamp"]);
+        }
+
+        if (obj.hasOwnProperty("exaust")) {
+          setExaust((bool) obj["exaust"]);
+        }
+
+        if (obj.hasOwnProperty("fan")) {
+          setFan((bool) obj["fan"]);
+        }
+
+      } else if (ret == pdFALSE) {
+        delay(10000);
+      }
+
+      JSONVar outputStatus;
+      outputStatus["serial"] = serial;
+      outputStatus["fanStatus"] = !digitalRead(fan);
+      outputStatus["lampStatus"] = !digitalRead(lamp);
+      outputStatus["exaustStatus"] = !digitalRead(exaust);
+      outputStatus["internalTemp"] = round((temprature_sens_read() - 32) / 1.8);
+
+      String output_message = JSON.stringify(outputStatus);
+      int output_len = output_message.length();
+      byte publish_byte[output_len];
+      output_message.getBytes(publish_byte, output_len);
+      client.publish(status_topic, (char*) publish_byte);
     }
+  }
+}
 
-    String client_id = JSON.stringify(obj["client_id"]);
-    client_id.replace("\"", "");
-    if(client_id == serial) return;
+void callback(char* topic, byte* payload, unsigned int length) {
+  if (QueueHandle != NULL && uxQueueSpacesAvailable(QueueHandle) > 0) {
+    char str[length + 1];
+    memcpy(str, payload, length);
+    str[length] = 0;
 
-    if (obj.hasOwnProperty("lamp")) {
-      setLamp((bool) obj["lamp"]);
+    int ret = xQueueSend(QueueHandle, (void *)&str, 0);
+    if (ret == errQUEUE_FULL) {
+      Serial.println("The `TaskReadFromSerial` was unable to send data into the Queue");
     }
-
-    if (obj.hasOwnProperty("exaust")) {
-      setExaust((bool) obj["exaust"]);
-    }
-
-    if (obj.hasOwnProperty("fan")) {
-      setFan((bool) obj["fan"]);
-    }
-
-    JSONVar outputStatus;
-    outputStatus["client_id"] = serial;
-    outputStatus["serial"] = client_id;
-    outputStatus["fanStatus"] = !digitalRead(fan);
-    outputStatus["lampStatus"] = !digitalRead(lamp);
-    outputStatus["exaustStatus"] = !digitalRead(exaust);
-
-    String output_message = JSON.stringify(outputStatus);
-    client.send(output_message);        // envia os estados dos atuadores para o client
-  });
-  client.setCACert(echo_org_ssl_ca_cert);
-  client.connect(websockets_server);
+  }
 }
  
 void setup(void) {
@@ -262,6 +282,7 @@ void setup(void) {
     Serial.print(".");
   }
     
+  wifiClient.setCACert(echo_org_ssl_ca_cert);
   Serial.println("");
   Serial.print("Conectado a rede wi-fi ");
   Serial.println(ssid);
@@ -324,18 +345,46 @@ void setup(void) {
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  initWebSocket();
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback);
+  while(!client.connected()) {
+    String client_id = serial;
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)){
+      Serial.println("Connected into automotion server");
+    }
+    else {
+      Serial.print("failed with state ");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+
+  char s [40];
+  strcpy (s, topic);
+  strcat (s, serial);
+  client.subscribe(s);
+
+  QueueHandle = xQueueCreate(QueueElementSize, sizeof(message_t));
+  while (QueueHandle == NULL) {
+    Serial.println("Queue could not be created. Halt.");
+    delay(1000);  // Halt at this point as is not possible to continue
+  }
+
+  delay(10000);
+  xTaskCreatePinnedToCore(
+    proccessQueue,
+    "Status Monitor",
+    10000,
+    NULL,
+    1,
+    NULL,
+    0
+  );
 }
  
 void loop() {
   server.handleClient();
-  if(client.available()){
-    client.poll();
-  }
-  else {
-    initWebSocket();
-    delay(1000);
-  }
+  client.loop();
 }
 
 // https://cplusplus.com/reference/ctime/strftime/
